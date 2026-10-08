@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Problems with Claude Code itself
+    url: https://github.com/anthropics/claude-code/issues
+    about: Report bugs in Claude Code, including the status line payload, to Anthropic.
