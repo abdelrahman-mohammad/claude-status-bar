@@ -1,0 +1,53 @@
+name: Bug report
+description: Something renders wrong, or not at all.
+labels: ["type: bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What the line showed, and what you expected instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      options:
+        - Status line
+        - Agent panel rows
+        - Fable weekly limit
+        - Install or docs
+    validations:
+      required: true
+  - type: textarea
+    id: input
+    attributes:
+      label: Status line input
+      description: The JSON Claude Code sent, if you can capture it. Putting `tee ~/status-input.json |` in front of the command in settings.json saves a copy in your home directory, outside any repository. Remove anything private first, such as paths, session IDs and repository names.
+      render: json
+  - type: input
+    id: claude-version
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`.
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows (Git Bash)
+        - Windows (PowerShell)
+        - macOS
+        - Linux
+    validations:
+      required: true

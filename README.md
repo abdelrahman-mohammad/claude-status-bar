@@ -123,6 +123,8 @@ npm test
 
 The tests use the built-in `node:test` runner and need no install. They run each script the way Claude Code does, with JSON on stdin, in a temp and config directory of their own, so they never read your credentials, your cache or your auto-compact settings. Network tests run against a local server.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
 ## License
 
 [MIT](LICENSE)
