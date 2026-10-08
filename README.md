@@ -51,9 +51,31 @@ The command uses `${USERPROFILE:-$HOME}` rather than `~` or `$HOME`. Depending o
 
 Without Git Bash, Claude Code runs the command through PowerShell, where `${USERPROFILE:-$HOME}` expands to nothing. Write `$env:USERPROFILE` in its place. That setup is untested here; please open an issue if it does not work for you.
 
+## Agent panel rows
+
+`subagent-statusline.cjs` replaces the default row for each subagent in the agent panel with the same vocabulary:
+
+```
+reviewer  Review the diff  Sonnet high  21%
+```
+
+```json
+{
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "node \"${USERPROFILE:-$HOME}/.claude/claude-status-bar/subagent-statusline.cjs\""
+  }
+}
+```
+
+- The title is the name the subagent is addressed by, or its agent type, such as `Explore`, when it has no name.
+- Next comes Claude Code's progress summary for the task, which is the task description until there is one.
+- Until an agent's context window size is known, the row shows its raw token count, such as `8.5k`, instead of a percentage. An effort given as a token budget shows as `32k`.
+- The row never exceeds the width Claude Code reports. The summary shrinks first, then the model and effort drop out, then the context, and the title is cut last.
+
 ## Colors and thresholds
 
-The context percentage turns red near auto-compaction, and yellow ahead of that: 20 points below red, or at half of red when red is low.
+The context percentage turns red near auto-compaction, and yellow ahead of that: 20 points below red, or at half of red when red is low. The agent rows use the same thresholds, scaled to each agent's own context window.
 
 - Without `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, Claude Code picks the compaction point per model and a status line command cannot see it, so red starts at 90% as an early warning.
 - With `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, red starts at that percentage of the auto-compact window.
