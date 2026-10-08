@@ -1,0 +1,13 @@
+{
+  "name": "claude-status-bar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Claude Code status line: project, model, effort, context and plan limits.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.cjs\""
+  }
+}
