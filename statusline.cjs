@@ -24,6 +24,18 @@ const RATE_HIGH_PCT = 90;
 // limit late in it, so it stays hidden until it is worth reading.
 const WEEK_SHOW_PCT = 50;
 
+// The Fable weekly limit is not in the payload; see usage-cache.cjs. A missing
+// module must cost the segment, not the line. The variable is the opt-out that
+// survives a git pull, which would restore a deleted module.
+let usage = null;
+if (process.env.CLAUDE_STATUS_BAR_USAGE !== 'off') {
+  try {
+    usage = require('./usage-cache.cjs');
+  } catch {
+    // Segment stays hidden.
+  }
+}
+
 /** Last path segment of a Windows or POSIX path, without a trailing separator. */
 function basename(p) {
   return String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
@@ -48,14 +60,22 @@ function limitPct(pct) {
   return `${color}${Math.round(pct)}%${RESET}`;
 }
 
+/** Fable weekly percentage from the cached usage endpoint rows, or null when unknown. */
+function fablePct() {
+  const row = (usage?.readScoped() || []).find((r) => /fable/i.test(r.label));
+  return row ? row.percent : null;
+}
+
 /** Subscription usage. Absent on API billing and before the first API response. */
 function rateSegment(limits) {
   if (!limits) return null;
   const parts = [];
   const fiveHour = limits.five_hour?.used_percentage;
   const week = limits.seven_day?.used_percentage;
+  const fable = fablePct();
   if (typeof fiveHour === 'number') parts.push(`${DIM}5h${RESET} ${limitPct(fiveHour)}`);
   if (typeof week === 'number' && week >= WEEK_SHOW_PCT) parts.push(`${DIM}7d${RESET} ${limitPct(week)}`);
+  if (fable !== null) parts.push(`${DIM}Fable${RESET} ${limitPct(fable)}`);
   return parts.length ? parts.join(` ${DIM}·${RESET} `) : null;
 }
 

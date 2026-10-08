@@ -1,5 +1,7 @@
-const { test, before, after } = require('node:test');
+const { test, before, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createSandbox, run, plain } = require('./helpers.cjs');
 
 const DIM = '\x1b[2m';
@@ -12,6 +14,12 @@ before(() => {
   sandbox = createSandbox();
 });
 after(() => sandbox.cleanup());
+
+// A fresh attempt keeps the usage cache from starting a background refresh,
+// which is covered in usage.test.cjs.
+beforeEach(() => {
+  fs.writeFileSync(path.join(sandbox.config, 'claude-status-bar-usage.json'), JSON.stringify({ attempted_at: Date.now() }));
+});
 
 const BASE = {
   model: { display_name: 'Opus' },
