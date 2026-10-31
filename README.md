@@ -12,7 +12,7 @@ Plain Node.js with no dependencies. Nothing on the render path waits on the netw
 
 | Segment | Example | Source | Notes |
 | --- | --- | --- | --- |
-| Project | `my-app` | `workspace.project_dir` | Last folder name, cut at 20 characters. Inside a linked git worktree it adds `:worktree-name`. |
+| Project | `my-app` | `workspace.project_dir`, `workspace.repo.name`, `workspace.git_worktree` | Last folder name. The repo name from `origin` follows in parentheses when it differs, ignoring case and `-`, `_`, `.` and spaces: `my-app (app-server)`. Inside a linked worktree the folder is the main checkout's and the worktree name follows a colon: `my-app:fix-auth`, or `my-app (app-server:fix-auth)`. Each name is cut at 20 characters. |
 | Model and effort | `Opus xhigh` | `model.display_name`, `effort.level` | Effort is left out when the model does not support it. |
 | Context | `34%` | `context_window.used_percentage` | Green, yellow, then red near auto-compaction; see [Colors and thresholds](#colors-and-thresholds). |
 | 5-hour limit | `5h 22%` | `rate_limits.five_hour` | Dim, yellow from 75%, red from 90%. |
