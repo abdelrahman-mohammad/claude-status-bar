@@ -3,6 +3,8 @@
 // render path waits on the network or on a subprocess - the status line is
 // cancelled if it is still running when the next update fires.
 
+const fs = require('fs');
+const path = require('path');
 const { contextThresholds } = require('./thresholds.cjs');
 
 const RESET = '\x1b[0m';
@@ -39,6 +41,58 @@ if (process.env.CLAUDE_STATUS_BAR_USAGE !== 'off') {
 /** Last path segment of a Windows or POSIX path, without a trailing separator. */
 function basename(p) {
   return String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+}
+
+/**
+ * Folder name of the main checkout when `dir` is the root of a linked worktree,
+ * or null. A linked worktree's .git is a file such as
+ * `gitdir: /src/my-app/.git/worktrees/fix-auth`. The path may be relative, and a
+ * bare repository ends in `my-app.git/worktrees/...` or, laid out with a hidden
+ * directory, `my-app/.bare/worktrees/...`.
+ */
+function mainCheckoutName(dir) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(dir, '.git'), 'utf8');
+  } catch {
+    // Absent, or a directory: not a linked worktree root.
+    return null;
+  }
+  const found = /^gitdir:\s*(.+?)[\\/]+worktrees[\\/]+[^\\/]+[\\/]*\s*$/m.exec(text);
+  if (!found) return null;
+  const common = path.resolve(dir, found[1]);
+  // A hidden git directory such as .git or .bare is named after its parent.
+  const name = basename(common).replace(/\.git$/, '');
+  return (!name || name.startsWith('.') ? basename(path.dirname(common)) : name) || null;
+}
+
+/** True when two names differ only in case and in `-`, `_`, `.` or spaces. */
+function sameName(a, b) {
+  const squash = (s) => String(s).toLowerCase().replace(/[-_.\s]/g, '');
+  return squash(a) === squash(b);
+}
+
+/**
+ * Project label: `folder`, `folder:worktree`, `folder (repo)` or
+ * `folder (repo:worktree)`. The repo name from `origin` shows only when it
+ * differs from the folder. Claude Code reports a worktree's own folder as
+ * project_dir, whose name is the worktree name, so at a worktree root the main
+ * checkout supplies the folder and the label matches the main checkout's.
+ * Without a main checkout, a folder named like the worktree shows once.
+ */
+function projectLabel(workspace, cwd) {
+  const dir = workspace?.project_dir || workspace?.current_dir || cwd;
+  const main = workspace?.git_worktree && dir ? mainCheckoutName(dir) : null;
+  const folder = main || basename(dir) || '~';
+  const repo = workspace?.repo?.name && !sameName(workspace.repo.name, folder) ? workspace.repo.name : '';
+  // With a main checkout found, a worktree named like it is still a worktree.
+  const worktree =
+    workspace?.git_worktree && (main || !sameName(workspace.git_worktree, folder)) ? workspace.git_worktree : '';
+
+  const head = `${BOLD}${CYAN}${clamp(folder, MAX_PROJECT)}${RESET}`;
+  const tree = worktree ? `:${clamp(worktree, MAX_PROJECT)}` : '';
+  if (repo) return `${head} ${DIM}(${clamp(repo, MAX_PROJECT)}${tree})${RESET}`;
+  return tree ? `${head}${DIM}${tree}${RESET}` : head;
 }
 
 function clamp(text, max) {
@@ -82,12 +136,7 @@ function rateSegment(limits) {
 function render(data) {
   const segments = [];
 
-  const project = basename(data.workspace?.project_dir || data.workspace?.current_dir || data.cwd) || '~';
-  const worktree = data.workspace?.git_worktree;
-  segments.push(
-    `${BOLD}${CYAN}${clamp(project, MAX_PROJECT)}${RESET}` +
-      (worktree ? `${DIM}:${clamp(worktree, MAX_PROJECT)}${RESET}` : '')
-  );
+  segments.push(projectLabel(data.workspace, data.cwd));
 
   const model = data.model?.display_name;
   const effort = data.effort?.level;

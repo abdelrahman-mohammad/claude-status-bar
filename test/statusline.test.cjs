@@ -61,6 +61,102 @@ test('adds the worktree name inside a linked worktree', () => {
   assert.match(plain(out), /^my-app:fix-auth /);
 });
 
+/** A worktree root whose .git file points at `gitdir`, laid out the way Claude Code creates them. */
+function linkedWorktree(root, gitdir, name = 'fix-auth') {
+  const tree = path.join(root, '.claude', 'worktrees', name);
+  fs.mkdirSync(tree, { recursive: true });
+  fs.writeFileSync(path.join(tree, '.git'), `gitdir: ${gitdir}\n`);
+  return tree;
+}
+
+test('names the project after the main checkout inside a linked worktree', () => {
+  const main = path.join(sandbox.tmp, 'my-app');
+  const tree = linkedWorktree(main, path.join(main, '.git', 'worktrees', 'fix-auth'));
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^my-app:fix-auth /);
+});
+
+test('follows a relative gitdir path', () => {
+  const main = path.join(sandbox.tmp, 'relative-app');
+  const tree = linkedWorktree(main, '../../../.git/worktrees/fix-auth');
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^relative-app:fix-auth /);
+});
+
+test('drops .git from the name of a bare repository', () => {
+  const tree = linkedWorktree(path.join(sandbox.tmp, 'bare-checkouts'), path.join(sandbox.tmp, 'bare-app.git', 'worktrees', 'fix-auth'));
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^bare-app:fix-auth /);
+});
+
+test('names a bare repository in a hidden directory after its parent', () => {
+  const root = path.join(sandbox.tmp, 'hidden-app');
+  const tree = linkedWorktree(root, path.join(root, '.bare', 'worktrees', 'fix-auth'));
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^hidden-app:fix-auth /);
+});
+
+test('keeps a worktree named like its main checkout', () => {
+  const main = path.join(sandbox.tmp, 'api');
+  const tree = linkedWorktree(main, path.join(main, '.git', 'worktrees', 'api'), 'api');
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'api' } })), /^api:api /);
+});
+
+test('reads nothing from a .git directory', () => {
+  const dir = path.join(sandbox.tmp, 'dir-app');
+  fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
+  assert.match(plain(line({ workspace: { project_dir: dir, git_worktree: 'fix-auth' } })), /^dir-app:fix-auth /);
+});
+
+test('shows the worktree name once when the main checkout is unknown', () => {
+  const out = plain(line({ workspace: { project_dir: '/src/no-such-dir/fix-auth', git_worktree: 'fix-auth' } }));
+  assert.match(out, /^fix-auth {2}Opus /);
+});
+
+test('keeps the folder name in a subfolder of a worktree', () => {
+  const main = path.join(sandbox.tmp, 'sub-app');
+  const web = path.join(linkedWorktree(main, path.join(main, '.git', 'worktrees', 'fix-auth')), 'web');
+  fs.mkdirSync(web, { recursive: true });
+  assert.match(plain(line({ workspace: { project_dir: web, git_worktree: 'fix-auth' } })), /^web:fix-auth /);
+});
+
+test('adds the repo name in parentheses when it differs from the folder', () => {
+  const out = line({ workspace: { project_dir: '/src/my-app', repo: { name: 'app-server' } } });
+  assert.equal(plain(out), 'my-app (app-server)  Opus xhigh  34%\n');
+});
+
+test('leaves out a repo name that matches the folder', () => {
+  assert.match(plain(line({ workspace: { project_dir: '/src/my-app', repo: { name: 'my-app' } } })), /^my-app {2}Opus /);
+});
+
+test('matches names regardless of case and separators', () => {
+  const label = (folder, repo) => plain(line({ workspace: { project_dir: `/src/${folder}`, repo: { name: repo } } }));
+  assert.match(label('MyApp', 'my-app'), /^MyApp {2}Opus /);
+  assert.match(label('My App', 'my-app'), /^My App {2}Opus /);
+  assert.match(label('my_app', 'my.app'), /^my_app {2}Opus /);
+});
+
+test('cuts the repo and worktree names at 20 characters', () => {
+  const out = line({
+    workspace: { project_dir: '/src/my-app', git_worktree: 'a-very-long-worktree-name', repo: { name: 'a-very-long-repository-name' } },
+  });
+  assert.match(plain(out), /^my-app \(a-very-long-reposit…:a-very-long-worktre…\) {2}Opus /);
+});
+
+test('puts the worktree inside the parentheses when the repo name differs', () => {
+  const main = path.join(sandbox.tmp, 'repo-app');
+  const tree = linkedWorktree(main, path.join(main, '.git', 'worktrees', 'fix-auth'));
+  const out = line({ workspace: { project_dir: tree, git_worktree: 'fix-auth', repo: { name: 'app-server' } } });
+  assert.match(plain(out), /^repo-app \(app-server:fix-auth\) {2}Opus /);
+});
+
+test('keeps folder:worktree when the repo name matches the folder', () => {
+  const main = path.join(sandbox.tmp, 'same-app');
+  const tree = linkedWorktree(main, path.join(main, '.git', 'worktrees', 'fix-auth'));
+  const out = line({ workspace: { project_dir: tree, git_worktree: 'fix-auth', repo: { name: 'same-app' } } });
+  assert.match(plain(out), /^same-app:fix-auth {2}Opus /);
+});
+
+test('names the repo when Claude Code starts in a subfolder', () => {
+  assert.match(plain(line({ workspace: { project_dir: '/src/my-app/web', repo: { name: 'my-app' } } })), /^web \(my-app\) {2}Opus /);
+});
+
 test('leaves out effort when the model has none', () => {
   assert.equal(plain(line({ effort: undefined })), 'my-app  Opus  34%\n');
 });
