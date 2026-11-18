@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Status line: project, model, effort, context, rate limits. Nothing on the
+// Status line: project, branch, model, effort, context, rate limits. Nothing on the
 // render path waits on the network or on a subprocess - the status line is
 // cancelled if it is still running when the next update fires.
 
@@ -11,6 +11,7 @@ const RESET = '\x1b[0m';
 const DIM = '\x1b[2m';
 const BOLD = '\x1b[1m';
 const CYAN = '\x1b[36m';
+const MAGENTA = '\x1b[35m';
 const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
 const RED = '\x1b[31m';
@@ -95,8 +96,75 @@ function projectLabel(workspace, cwd) {
   return tree ? `${head}${DIM}${tree}${RESET}` : head;
 }
 
+/** `text` cut to `max` characters with `…`, counting code points so an emoji is never split. */
 function clamp(text, max) {
-  return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  const chars = Array.from(text);
+  return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : text;
+}
+
+/**
+ * Git directory for `dir`: the nearest `.git` at or above it, following the
+ * `gitdir:` pointer that a linked worktree or submodule keeps in a `.git` file.
+ * Null outside a repository or when `dir` does not exist. As git does, it
+ * resolves symlinks first, walks past a `.git` directory with no HEAD, and stops
+ * at the first `.git` file.
+ */
+function gitDir(dir) {
+  let current;
+  try {
+    current = fs.realpathSync.native(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    // Some virtual drives refuse realpath; walk the path as given.
+    current = path.resolve(dir);
+  }
+  for (;;) {
+    const entry = path.join(current, '.git');
+    let stat = null;
+    try {
+      stat = fs.statSync(entry);
+    } catch {
+      // Not here; look one level up.
+    }
+    if (stat?.isDirectory() && fs.existsSync(path.join(entry, 'HEAD'))) return entry;
+    if (stat?.isFile()) {
+      try {
+        const found = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(entry, 'utf8'));
+        return found ? path.resolve(current, found[1]) : null;
+      } catch {
+        return null;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/**
+ * Branch segment for `dir`, or null outside a repository or when HEAD cannot be
+ * read. A detached HEAD shows the short commit in yellow, because commits made
+ * there are easy to lose.
+ */
+function branchSegment(dir, worktree) {
+  const git = typeof dir === 'string' && dir ? gitDir(dir) : null;
+  if (!git) return null;
+  let head;
+  try {
+    head = fs.readFileSync(path.join(git, 'HEAD'), 'utf8').trim();
+  } catch {
+    return null;
+  }
+  // A SHA-1 or SHA-256 commit.
+  if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(head)) return `${YELLOW}${head.slice(0, 7)}${RESET}`;
+  const branch = /^ref:\s*refs\/heads\/(.+)$/.exec(head)?.[1];
+  // Names git forbids: a reftable repository's HEAD always reads `.invalid`, and
+  // a control character would reach the terminal as a live escape code.
+  if (!branch || /(^|\/)\.|[\x00-\x1f\x7f]/.test(branch)) return null;
+  // Claude Code names a worktree's branch worktree-<name>, which only repeats
+  // the worktree name already in the project label.
+  if (worktree && (sameName(branch, worktree) || sameName(branch, `worktree-${worktree}`))) return null;
+  return `${MAGENTA}${clamp(branch, MAX_PROJECT)}${RESET}`;
 }
 
 /** Context percentage, colored by how close it is to auto-compaction. */
@@ -137,6 +205,14 @@ function render(data) {
   const segments = [];
 
   segments.push(projectLabel(data.workspace, data.cwd));
+
+  // git_worktree describes the current directory, so the branch must come from
+  // there too, or the rule that hides a worktree's own branch compares two checkouts.
+  const branch = branchSegment(
+    data.workspace?.current_dir || data.cwd || data.workspace?.project_dir,
+    data.workspace?.git_worktree
+  );
+  if (branch) segments.push(branch);
 
   const model = data.model?.display_name;
   const effort = data.effort?.level;

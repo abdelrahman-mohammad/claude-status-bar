@@ -157,6 +157,159 @@ test('names the repo when Claude Code starts in a subfolder', () => {
   assert.match(plain(line({ workspace: { project_dir: '/src/my-app/web', repo: { name: 'my-app' } } })), /^web \(my-app\) {2}Opus /);
 });
 
+/** A main checkout whose .git/HEAD holds `head`. */
+function checkout(name, head) {
+  const root = path.join(sandbox.tmp, name);
+  fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.git', 'HEAD'), `${head}\n`);
+  return root;
+}
+
+/** A linked worktree of a new main checkout, with the worktree's HEAD set to `head`. */
+function worktreeOn(name, head, worktree = 'fix-auth') {
+  const main = path.join(sandbox.tmp, name);
+  const gitdir = path.join(main, '.git', 'worktrees', worktree);
+  fs.mkdirSync(gitdir, { recursive: true });
+  fs.writeFileSync(path.join(gitdir, 'HEAD'), `${head}\n`);
+  return linkedWorktree(main, gitdir, worktree);
+}
+
+const MAGENTA = '\x1b[35m';
+const SHA = '0123456789abcdef0123456789abcdef01234567';
+
+test('shows the branch after the project, in its own color', () => {
+  const out = line({ workspace: { project_dir: checkout('branch-app', 'ref: refs/heads/main') } });
+  assert.equal(plain(out), 'branch-app  main  Opus xhigh  34%\n');
+  assert.ok(out.includes(MAGENTA + 'main'));
+});
+
+test('shows a branch name with slashes', () => {
+  const out = line({ workspace: { project_dir: checkout('slash-app', 'ref: refs/heads/feat/login') } });
+  assert.match(plain(out), /^slash-app {2}feat\/login {2}Opus /);
+});
+
+test('finds the repository from a subfolder', () => {
+  const web = path.join(checkout('nested-app', 'ref: refs/heads/main'), 'web');
+  fs.mkdirSync(web, { recursive: true });
+  assert.match(plain(line({ workspace: { project_dir: web } })), /^web {2}main {2}Opus /);
+});
+
+test('uses the nearest repository', () => {
+  checkout('outer-app', 'ref: refs/heads/main');
+  const inner = checkout(path.join('outer-app', 'inner'), 'ref: refs/heads/inner-branch');
+  assert.match(plain(line({ workspace: { project_dir: inner } })), /^inner {2}inner-branch {2}Opus /);
+});
+
+test('walks past a .git directory with no HEAD, as git does', () => {
+  const inner = path.join(checkout('outer-app-2', 'ref: refs/heads/main'), 'inner');
+  fs.mkdirSync(path.join(inner, '.git'), { recursive: true });
+  assert.match(plain(line({ workspace: { project_dir: inner } })), /^inner {2}main {2}Opus /);
+});
+
+test('stops at a .git file with no gitdir line', () => {
+  const sub = path.join(checkout('gitfile-app', 'ref: refs/heads/main'), 'sub');
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, '.git'), 'not a gitdir pointer\n');
+  assert.match(plain(line({ workspace: { project_dir: sub } })), /^sub {2}Opus /);
+});
+
+test('reads CRLF line endings in HEAD and in a .git file', () => {
+  assert.match(plain(line({ workspace: { project_dir: checkout('crlf-app', 'ref: refs/heads/main\r') } })), /^crlf-app {2}main {2}Opus /);
+  const main = path.join(sandbox.tmp, 'crlf-wt-app');
+  const gitdir = path.join(main, '.git', 'worktrees', 'fix-auth');
+  fs.mkdirSync(gitdir, { recursive: true });
+  fs.writeFileSync(path.join(gitdir, 'HEAD'), 'ref: refs/heads/login-form\r\n');
+  const tree = linkedWorktree(main, gitdir);
+  fs.writeFileSync(path.join(tree, '.git'), `gitdir: ${gitdir}\r\n`);
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^crlf-wt-app:fix-auth {2}login-form {2}Opus /);
+});
+
+test('resolves a junction or symlink before looking for the repository', () => {
+  const target = path.join(checkout('link-target-app', 'ref: refs/heads/main'), 'deep');
+  fs.mkdirSync(target, { recursive: true });
+  const link = path.join(sandbox.tmp, 'link-outside');
+  fs.symlinkSync(target, link, 'junction');
+  assert.match(plain(line({ workspace: { project_dir: link } })), /^link-outside {2}main {2}Opus /);
+});
+
+test('shows no branch for a directory that no longer exists', () => {
+  const gone = path.join(checkout('gone-app', 'ref: refs/heads/main'), 'removed-worktree');
+  assert.match(plain(line({ workspace: { project_dir: gone } })), /^removed-worktree {2}Opus /);
+});
+
+test('reads the branch of a linked worktree', () => {
+  const tree = worktreeOn('wt-app', 'ref: refs/heads/login-form');
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^wt-app:fix-auth {2}login-form {2}Opus /);
+});
+
+test('follows a relative gitdir to the worktree HEAD', () => {
+  const main = path.join(sandbox.tmp, 'rel-wt-app');
+  const gitdir = path.join(main, '.git', 'worktrees', 'fix-auth');
+  fs.mkdirSync(gitdir, { recursive: true });
+  fs.writeFileSync(path.join(gitdir, 'HEAD'), 'ref: refs/heads/login-form\n');
+  const tree = linkedWorktree(main, '../../../.git/worktrees/fix-auth');
+  assert.match(plain(line({ workspace: { project_dir: tree, git_worktree: 'fix-auth' } })), /^rel-wt-app:fix-auth {2}login-form {2}Opus /);
+});
+
+test('hides a branch that repeats the worktree name', () => {
+  const claude = worktreeOn('hide-app', 'ref: refs/heads/worktree-fix-auth');
+  assert.match(plain(line({ workspace: { project_dir: claude, git_worktree: 'fix-auth' } })), /^hide-app:fix-auth {2}Opus /);
+  const plainName = worktreeOn('hide-app-2', 'ref: refs/heads/fix-auth');
+  assert.match(plain(line({ workspace: { project_dir: plainName, git_worktree: 'fix-auth' } })), /^hide-app-2:fix-auth {2}Opus /);
+  const loose = worktreeOn('hide-app-3', 'ref: refs/heads/Worktree_Fix_Auth');
+  assert.match(plain(line({ workspace: { project_dir: loose, git_worktree: 'fix-auth' } })), /^hide-app-3:fix-auth {2}Opus /);
+});
+
+test('shows a detached HEAD as the short commit in yellow', () => {
+  const out = line({ workspace: { project_dir: checkout('detached-app', SHA) } });
+  assert.match(plain(out), /^detached-app {2}0123456 {2}Opus /);
+  assert.ok(out.includes(YELLOW + '0123456'));
+  const sha256 = SHA + 'abcdef0123456789abcdef01';
+  assert.match(plain(line({ workspace: { project_dir: checkout('sha256-app', sha256) } })), /^sha256-app {2}0123456 {2}Opus /);
+});
+
+test('cuts a long branch name at 20 characters', () => {
+  const out = line({ workspace: { project_dir: checkout('long-branch-app', 'ref: refs/heads/feat/a-very-long-branch-name') } });
+  assert.match(plain(out), /^long-branch-app {2}feat\/a-very-long-br… {2}Opus /);
+});
+
+test('never cuts an emoji in half', () => {
+  const out = plain(line({ workspace: { project_dir: checkout('emoji-app', 'ref: refs/heads/feat/aaaaaaaaaaaaa😀tail') } }));
+  assert.match(out, /^emoji-app {2}feat\/aaaaaaaaaaaaa😀… {2}Opus /);
+  assert.ok(!out.includes('�'));
+});
+
+test('reads the branch from the current directory, then cwd, then project_dir', () => {
+  const project = checkout('project-app', 'ref: refs/heads/main');
+  const current = checkout('current-app', 'ref: refs/heads/feat/login');
+  const shell = checkout('shell-app', 'ref: refs/heads/feat/shell');
+  assert.match(plain(line({ workspace: { project_dir: project, current_dir: current }, cwd: shell })), /^project-app {2}feat\/login {2}Opus /);
+  assert.match(plain(line({ workspace: { project_dir: project }, cwd: shell })), /^project-app {2}feat\/shell {2}Opus /);
+});
+
+test('shows no branch outside a repository', () => {
+  assert.equal(plain(line()), 'my-app  Opus xhigh  34%\n');
+});
+
+test('drops the branch for a HEAD it cannot use, and keeps the line', () => {
+  const heads = {
+    remote: 'ref: refs/remotes/origin/main',
+    garbage: 'garbage',
+    'odd-hash': SHA + 'ab',
+    reftable: 'ref: refs/heads/.invalid',
+    control: 'ref: refs/heads/a\x1b[31mRED',
+  };
+  for (const [name, head] of Object.entries(heads)) {
+    const out = line({ workspace: { project_dir: checkout(`head-${name}`, head) } });
+    assert.equal(plain(out), `head-${name}  Opus xhigh  34%\n`, name);
+    assert.ok(!out.includes('\x1b[31mRED'), name);
+  }
+});
+
+test('survives a directory that is not a string', () => {
+  assert.equal(plain(line({ workspace: { project_dir: 42, current_dir: { x: 1 } } })), '42  Opus xhigh  34%\n');
+});
+
 test('leaves out effort when the model has none', () => {
   assert.equal(plain(line({ effort: undefined })), 'my-app  Opus  34%\n');
 });
