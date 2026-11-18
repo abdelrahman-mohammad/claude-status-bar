@@ -96,17 +96,28 @@ function projectLabel(workspace, cwd) {
   return tree ? `${head}${DIM}${tree}${RESET}` : head;
 }
 
+/** `text` cut to `max` characters with `…`, counting code points so an emoji is never split. */
 function clamp(text, max) {
-  return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  const chars = Array.from(text);
+  return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : text;
 }
 
 /**
  * Git directory for `dir`: the nearest `.git` at or above it, following the
  * `gitdir:` pointer that a linked worktree or submodule keeps in a `.git` file.
- * Null outside a repository. Like git, it stops at the first `.git` it finds.
+ * Null outside a repository or when `dir` does not exist. As git does, it
+ * resolves symlinks first, walks past a `.git` directory with no HEAD, and stops
+ * at the first `.git` file.
  */
 function gitDir(dir) {
-  let current = path.resolve(dir);
+  let current;
+  try {
+    current = fs.realpathSync.native(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    // Some virtual drives refuse realpath; walk the path as given.
+    current = path.resolve(dir);
+  }
   for (;;) {
     const entry = path.join(current, '.git');
     let stat = null;
@@ -115,7 +126,7 @@ function gitDir(dir) {
     } catch {
       // Not here; look one level up.
     }
-    if (stat?.isDirectory()) return entry;
+    if (stat?.isDirectory() && fs.existsSync(path.join(entry, 'HEAD'))) return entry;
     if (stat?.isFile()) {
       try {
         const found = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(entry, 'utf8'));
@@ -144,9 +155,12 @@ function branchSegment(dir, worktree) {
   } catch {
     return null;
   }
-  if (/^[0-9a-f]{40,64}$/i.test(head)) return `${YELLOW}${head.slice(0, 7)}${RESET}`;
+  // A SHA-1 or SHA-256 commit.
+  if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(head)) return `${YELLOW}${head.slice(0, 7)}${RESET}`;
   const branch = /^ref:\s*refs\/heads\/(.+)$/.exec(head)?.[1];
-  if (!branch) return null;
+  // Names git forbids: a reftable repository's HEAD always reads `.invalid`, and
+  // a control character would reach the terminal as a live escape code.
+  if (!branch || /(^|\/)\.|[\x00-\x1f\x7f]/.test(branch)) return null;
   // Claude Code names a worktree's branch worktree-<name>, which only repeats
   // the worktree name already in the project label.
   if (worktree && (sameName(branch, worktree) || sameName(branch, `worktree-${worktree}`))) return null;
