@@ -93,7 +93,7 @@ Limitations:
 - On macOS, Claude Code keeps its credentials in the Keychain rather than `.credentials.json`, so the Fable segment stays hidden there for now ([#6](https://github.com/abdelrahman-mohammad/claude-status-bar/issues/6)).
 - Behind a TLS-inspecting antivirus or corporate proxy, the refresh runs Node with `--use-system-ca` so your operating system's certificate store is trusted. Node versions that do not know the flag run without it.
 
-To turn the endpoint off, set `CLAUDE_STATUS_BAR_USAGE` to `off` in the `env` block of `settings.json`:
+To turn the endpoint off, for the status line and for [`usage.cjs`](#plan-usage-as-json), set `CLAUDE_STATUS_BAR_USAGE` to `off` in the `env` block of `settings.json`:
 
 ```json
 {
@@ -104,6 +104,57 @@ To turn the endpoint off, set `CLAUDE_STATUS_BAR_USAGE` to `off` in the `env` bl
 ```
 
 The status line keeps working without the Fable segment. Deleting `usage-cache.cjs` has the same effect, but `git pull` can bring it back.
+
+## Plan usage as JSON
+
+`usage.cjs` prints what the endpoint knows, for Claude and for scripts:
+
+```sh
+node ~/.claude/claude-status-bar/usage.cjs
+```
+
+```json
+{
+  "ok": true,
+  "stale": false,
+  "error": null,
+  "fetched_at": "2026-01-03T10:00:00.000Z",
+  "age_seconds": 12,
+  "limits": [
+    {
+      "kind": "weekly_all",
+      "scope": null,
+      "percent_used": 60,
+      "percent_left": 40,
+      "severity": "normal",
+      "headline": true,
+      "resets_at": "2026-01-07T22:00:00.000Z",
+      "resets_in_minutes": 6480,
+      "elapsed_percent": 35.7,
+      "projected_percent": 168,
+      "runs_out_at": "2026-01-05T02:00:00.000Z",
+      "weekly_share": null
+    }
+  ],
+  "products": [{ "name": "Claude Code", "percent_of_weekly_limit": 58 }],
+  "extra_usage": { "enabled": false, "percent": null }
+}
+```
+
+- `limits` lists every limit the server sends for your account and no others, so a plan without a 5-hour limit has no such entry. `scope` names the model or surface that a limit covers.
+- `elapsed_percent` is how much of the window has passed. `projected_percent` is where the limit ends at the rate so far, and `runs_out_at` is when it reaches 100%, or `null` when it lasts until the reset. Nothing is projected in the first 5% of a window.
+- `weekly_share` is how much of the whole weekly limit a scoped limit has used and may use.
+- It shares the status line's cache and throttle. Data younger than three minutes is answered at once; `--max-age <seconds>` changes that. A refresh happens at most once a minute and takes up to 15 seconds.
+- When a refresh fails, the cached data is printed with `stale: true` and the reason in `error`. Without any data the exit code is 1 and `ok` is `false`.
+
+`error` is `no_token` (no credentials file, or an expired token that Claude Code has not renewed yet), `network`, `http_<status>`, `bad_reply`, `no_data`, `disabled` or `bad_max_age`.
+
+To let Claude call it on its own, install the skill:
+
+```sh
+mkdir -p ~/.claude/skills/plan-usage
+cp ~/.claude/claude-status-bar/skills/plan-usage/SKILL.md ~/.claude/skills/plan-usage/
+```
 
 ## Colors and thresholds
 

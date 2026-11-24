@@ -5,7 +5,7 @@ Bug reports and pull requests are welcome. For anything larger than a small fix,
 ## Ground rules
 
 - No dependencies. Everything runs on the Node.js standard library.
-- Nothing on the render path waits on the network or on a subprocess. Claude Code cancels the status line command when the next update arrives, so a slow script shows stale output. The one exception to starting a process at all is the detached refresh in `usage-cache.cjs`, at most once every three minutes.
+- Nothing on the render path waits on the network or on a subprocess. Claude Code cancels the status line command when the next update arrives, so a slow script shows stale output. The one exception to starting a process at all is the detached refresh in `usage-cache.cjs`, at most once every three minutes. `usage.cjs` is not on the render path and may wait.
 - A segment with no data drops out. The one placeholder is `--%` for context before the first response.
 - Every change to the output comes with a test in `test/`. Tests run the scripts with JSON on stdin, as Claude Code does.
 - Never log, print or store the OAuth token. See [SECURITY.md](SECURITY.md).
@@ -22,7 +22,7 @@ Bug reports and pull requests are welcome. For anything larger than a small fix,
 | --- | --- |
 | `area: statusline` | `statusline.cjs` and `thresholds.cjs` |
 | `area: agent-rows` | `subagent-statusline.cjs` |
-| `area: usage` | `usage-cache.cjs` and the per-model weekly limits |
+| `area: usage` | `usage-cache.cjs`, `usage.cjs`, the `plan-usage` skill and the plan limits |
 | `area: ci` | GitHub Actions and the test harness |
 | `area: repo` | Templates, community files and repository settings |
 | `type: bug`, `type: feature`, `type: chore`, `type: docs` | What kind of change |
