@@ -267,6 +267,21 @@ test('ignores malformed cached rows instead of blanking the line', withSandbox((
   assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22% · Fable 37%\n');
 }));
 
+test('an odd cached value costs the segment, never the line', withSandbox((sandbox) => {
+  const odd = { ...FABLE, resets_at: { toString: 1, valueOf: 1 } };
+  writeCache(sandbox, { fetched_at: 1e300, usage: { limits: [FABLE] } });
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
+  writeCache(sandbox, fresh([odd]));
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22% · Fable 37%\n');
+}));
+
+test('a time from before the clock was set back is expired', withSandbox(async (sandbox) => {
+  const ahead = Date.now() + 6 * HOUR;
+  fs.writeFileSync(cacheFile(sandbox), JSON.stringify({ attempted_at: ahead, fetched_at: ahead, usage: { limits: [FABLE] } }));
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
+  await waitFor(() => JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')).error === 'no_token' && !fs.existsSync(cacheFile(sandbox) + '.lock'));
+}));
+
 test('hides the segment when the account has no Fable row', withSandbox((sandbox) => {
   writeCache(sandbox, fresh([{ ...FABLE, model: 'Opus' }, { ...FABLE, kind: 'weekly_all' }]));
   assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
@@ -300,6 +315,15 @@ test('a refresh drops fields an older version cached', withSandbox(async (sandbo
   run('statusline.cjs', BASE, { sandbox });
   await waitFor(() => !fs.existsSync(cacheFile(sandbox) + '.lock'));
   assert.equal(JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')).rows, undefined);
+}));
+
+test('a due refresh leaves a running one alone', withSandbox((sandbox) => {
+  const cache = { attempted_at: Date.now() - HOUR };
+  writeCache(sandbox, cache);
+  fs.writeFileSync(cacheFile(sandbox) + '.lock', 'another process');
+  run('statusline.cjs', BASE, { sandbox });
+  assert.equal(fs.readFileSync(cacheFile(sandbox) + '.lock', 'utf8'), 'another process');
+  assert.deepEqual(JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')), cache);
 }));
 
 test('a refresh is not repeated within three minutes of an attempt', withSandbox((sandbox) => {

@@ -58,10 +58,139 @@ function writeCache(sandbox, cache) {
 
 /** The command's exit code and parsed report. */
 function command(sandbox, args = [], env = {}) {
-  const result = spawnSync(process.execPath, [SCRIPT, ...args], { env: scriptEnv({ sandbox, env }), encoding: 'utf8' });
+  const options = { env: scriptEnv({ sandbox, env }), encoding: 'utf8', timeout: 60_000 };
+  const result = spawnSync(process.execPath, [SCRIPT, ...args], options);
   assert.equal(result.stderr, '');
   return { status: result.status, report: JSON.parse(result.stdout), stdout: result.stdout };
 }
+
+const TOKEN = 'sk-test-live-token';
+
+/** Environment that answers the command's refresh with `reply` instead of the network; see stub.cjs. */
+function stubbed(sandbox, reply, extra = {}) {
+  fs.writeFileSync(path.join(sandbox.config, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: TOKEN } }));
+  return {
+    NODE_OPTIONS: `--require "${path.join(__dirname, 'stub.cjs').replace(/\\/g, '/')}"`,
+    STUB_REPLY: JSON.stringify(reply),
+    STUB_LOG: path.join(sandbox.tmp, 'requests.log'),
+    ...extra,
+  };
+}
+
+/** The requests the stub saw. */
+function requests(sandbox) {
+  const log = path.join(sandbox.tmp, 'requests.log');
+  return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+}
+
+/** An endpoint reply with one weekly limit at `percent`. */
+function replyAt(percent) {
+  return { status: 200, body: { limits: [{ kind: 'weekly_all', group: 'weekly', percent, resets_at: at(Date.now() + DAY) }] } };
+}
+
+function age(file, ms) {
+  const time = new Date(Date.now() - ms);
+  fs.utimesSync(file, time, time);
+}
+
+test('a refresh asks the endpoint once, and its answer is fresh even with --max-age 0', withSandbox((sandbox) => {
+  const now = Date.now();
+  writeCache(sandbox, { attempted_at: now - 10 * MINUTE, fetched_at: now - 10 * MINUTE, usage: usageOf(weekly(now)), error: 'http_429' });
+  const { status, report, stdout } = command(sandbox, ['--max-age', '0'], stubbed(sandbox, replyAt(66)));
+  assert.equal(status, 0);
+  assert.equal(report.stale, false);
+  assert.equal(report.error, null);
+  assert.equal(report.limits[0].percent_used, 66);
+  assert.deepEqual(requests(sandbox), [{ host: 'api.anthropic.com', path: '/api/oauth/usage', authorization: `Bearer ${TOKEN}` }]);
+  const cached = fs.readFileSync(cacheFile(sandbox), 'utf8');
+  assert.equal(JSON.parse(cached).error, null);
+  assert.ok(!stdout.includes(TOKEN) && !cached.includes(TOKEN));
+  assert.deepEqual(fs.readdirSync(sandbox.config).sort(), ['.credentials.json', CACHE]);
+}));
+
+test('reports the status of a refused refresh, then that a second one is throttled', withSandbox((sandbox) => {
+  const env = stubbed(sandbox, { status: 429, body: {} });
+  assert.deepEqual(command(sandbox, [], env).report, { ok: false, error: 'http_429' });
+  const now = Date.now();
+  writeCache(sandbox, { attempted_at: now - 1000, fetched_at: now - 10 * MINUTE, usage: usageOf(weekly(now)) });
+  const { report } = command(sandbox, [], env);
+  assert.equal(report.stale, true);
+  assert.equal(report.error, 'throttled');
+  assert.equal(requests(sandbox).length, 1);
+}));
+
+test('reports a refresh that crashes, and releases its lock', withSandbox((sandbox) => {
+  const now = Date.now();
+  writeCache(sandbox, { attempted_at: now - 10 * MINUTE, fetched_at: now - 10 * MINUTE, usage: usageOf(weekly(now)), error: 'http_500' });
+  const { report } = command(sandbox, [], stubbed(sandbox, replyAt(1), { STUB_CRASH: '1' }));
+  assert.equal(report.stale, true);
+  assert.equal(report.error, 'refresh_failed');
+  assert.equal(fs.existsSync(lockFile(sandbox)), false);
+}));
+
+test('writes the cache although Windows refuses the rename for a while', withSandbox((sandbox) => {
+  const { report } = command(sandbox, [], stubbed(sandbox, replyAt(66), { STUB_RENAMES: '5' }));
+  assert.equal(report.ok, true);
+  assert.equal(report.limits[0].percent_used, 66);
+  assert.deepEqual(fs.readdirSync(sandbox.config).sort(), ['.credentials.json', CACHE]);
+}));
+
+test('leaves no file behind when the rename never succeeds, and reports it', withSandbox((sandbox) => {
+  const { status, report } = command(sandbox, [], stubbed(sandbox, replyAt(66), { STUB_RENAMES: '1000' }));
+  assert.equal(status, 1);
+  assert.deepEqual(report, { ok: false, error: 'refresh_failed' });
+  assert.deepEqual(fs.readdirSync(sandbox.config), ['.credentials.json']);
+}));
+
+test('a refresh removes old leftovers and nothing else', withSandbox((sandbox) => {
+  const names = [`${CACHE}.123.tmp`, `${CACHE}.456.tmp`, `${CACHE}.x.tmp`, `${CACHE}.bak`, 'other.json.123.tmp'];
+  for (const name of names) {
+    fs.writeFileSync(path.join(sandbox.config, name), '{}');
+    age(path.join(sandbox.config, name), name.includes('456') ? 0 : 2 * MINUTE);
+  }
+  command(sandbox, [], stubbed(sandbox, replyAt(66)));
+  assert.deepEqual(fs.readdirSync(sandbox.config).sort(), ['.credentials.json', CACHE, ...names.slice(1)].sort());
+}));
+
+test('reports a config directory that cannot be written', withSandbox((sandbox) => {
+  const missing = path.join(sandbox.config, 'missing');
+  const { status, report } = command(sandbox, [], { CLAUDE_CONFIG_DIR: missing });
+  assert.equal(status, 1);
+  assert.deepEqual(report, { ok: false, error: 'unwritable' });
+}));
+
+test('treats times from before a clock was set back as expired', withSandbox((sandbox) => {
+  const now = Date.now();
+  const ahead = { attempted_at: now + 6 * HOUR, fetched_at: now + 6 * HOUR, usage: usageOf(weekly(now)) };
+  writeCache(sandbox, ahead);
+  const old = command(sandbox).report;
+  assert.equal(old.stale, true);
+  assert.equal(old.age_seconds, null);
+  assert.equal(old.error, 'no_token');
+  writeCache(sandbox, ahead);
+  assert.equal(command(sandbox, [], stubbed(sandbox, replyAt(66))).report.limits[0].percent_used, 66);
+}));
+
+test('replaces a lock that is too old or from the future', withSandbox((sandbox) => {
+  for (const offset of [MINUTE, -HOUR]) {
+    fs.rmSync(cacheFile(sandbox), { force: true });
+    fs.writeFileSync(lockFile(sandbox), 'dead process');
+    age(lockFile(sandbox), offset);
+    const { report } = command(sandbox, [], stubbed(sandbox, replyAt(66)));
+    assert.equal(report.ok, true, String(offset));
+    assert.equal(fs.existsSync(lockFile(sandbox)), false);
+  }
+}));
+
+test('a refresh leaves a lock alone that another process took', withSandbox((sandbox) => {
+  fs.writeFileSync(lockFile(sandbox), 'another process');
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'usage-cache.cjs'), '--refresh', 'first process'], {
+    env: scriptEnv({ sandbox }),
+    timeout: 60_000,
+  });
+  assert.equal(result.status, 0);
+  assert.equal(fs.readFileSync(lockFile(sandbox), 'utf8'), 'another process');
+}));
 
 test('prints a fresh cache without a refresh', withSandbox((sandbox) => {
   const now = Date.now();
@@ -117,10 +246,38 @@ test('keeps a limit without a reset time, with no pace', () => {
   assert.equal(limit.projected_percent, null);
 });
 
-test('drops a limit whose window has reset', () => {
+test('drops a limit whose window has reset, and the products with the last weekly one', () => {
   const now = Date.now();
   const gone = weekly(now, { resets_at: at(now - MINUTE) });
-  assert.deepEqual(buildReport({ fetched_at: now, usage: usageOf(gone) }, { now }).limits, []);
+  const session = { ...weekly(now), kind: 'session', group: 'session', resets_at: at(now + HOUR) };
+  const report = buildReport({ fetched_at: now, usage: usageOf(gone, session) }, { now });
+  assert.deepEqual(report.limits.map((l) => l.kind), ['session']);
+  assert.deepEqual(report.products, []);
+  assert.equal(buildReport({ fetched_at: now, usage: usageOf(gone, weekly(now)) }, { now }).products.length, 1);
+});
+
+test('has no data when every limit has reset, but an account without limits is an answer', () => {
+  const now = Date.now();
+  const gone = weekly(now, { resets_at: at(now - MINUTE) });
+  assert.deepEqual(buildReport({ fetched_at: now, usage: usageOf(gone) }, { now }), { ok: false, error: 'no_data' });
+  assert.deepEqual(buildReport({ fetched_at: now, usage: usageOf(gone), error: 'http_500' }, { now }), { ok: false, error: 'http_500' });
+  const none = buildReport({ fetched_at: now, usage: usageOf() }, { now });
+  assert.equal(none.ok, true);
+  assert.deepEqual(none.limits, []);
+});
+
+test('keeps quiet about a failure while the data is fresh', () => {
+  const now = Date.now();
+  const report = buildReport({ fetched_at: now, usage: usageOf(weekly(now)), error: 'http_500' }, { now });
+  assert.equal(report.stale, false);
+  assert.equal(report.error, null);
+});
+
+test('counts the time the command itself took as fresh', () => {
+  const now = Date.now();
+  const cache = { fetched_at: now - 5000, usage: usageOf(weekly(now)) };
+  assert.equal(buildReport(cache, { now, startedAt: now - 8000, maxAgeMs: 0 }).stale, false);
+  assert.equal(buildReport(cache, { now, startedAt: now - 2000, maxAgeMs: 0 }).stale, true);
 });
 
 test('never reports less than nothing left', () => {
@@ -158,23 +315,26 @@ test('pace projects nothing early in a window, in an unknown group or outside th
   const now = Date.UTC(2099, 0, 4);
   const none = { elapsed_percent: null, projected_percent: null, runs_out_at: null };
   assert.deepEqual(pace(weekly(now, { resets_at: at(now + 7 * DAY - 2 * HOUR) }), now), { ...none, elapsed_percent: 1.2 });
-  assert.deepEqual(pace(weekly(now, { group: 'monthly' }), now), none);
+  for (const group of ['monthly', 'constructor', '__proto__', null]) assert.deepEqual(pace(weekly(now, { group }), now), none);
   assert.deepEqual(pace(weekly(now, { resets_at: at(now + 8 * DAY) }), now), none);
+  assert.deepEqual(pace(weekly(now, { resets_at: at(now - HOUR) }), now), none);
 });
 
 test('parseMaxAge reads seconds and rejects anything else', () => {
   assert.equal(parseMaxAge([]), 180_000);
   assert.equal(parseMaxAge(['--max-age', '60']), 60_000);
+  assert.equal(parseMaxAge(['--max-age', '1.5']), 1500);
   assert.equal(parseMaxAge(['--max-age', '0']), 0);
-  for (const bad of [['--max-age'], ['--max-age', ''], ['--max-age', ' '], ['--max-age', '-1'], ['--max-age', 'soon']]) {
+  const values = [undefined, '', ' ', '-1', 'soon', 'Infinity', '0x10', '1e9'].map((v) => ['--max-age', v]);
+  for (const bad of [...values, ['--max-age=60'], ['--help'], ['--help', '60'], ['60'], ['--max-age', '60', 'x']]) {
     assert.equal(parseMaxAge(bad), null, JSON.stringify(bad));
   }
 });
 
-test('refuses a bad --max-age without touching the cache', withSandbox((sandbox) => {
-  const { status, report } = command(sandbox, ['--max-age', 'soon']);
+test('refuses arguments it does not know without touching the cache', withSandbox((sandbox) => {
+  const { status, report } = command(sandbox, ['--max-age=60']);
   assert.equal(status, 1);
-  assert.deepEqual(report, { ok: false, error: 'bad_max_age' });
+  assert.deepEqual(report, { ok: false, error: 'bad_arguments' });
   assert.deepEqual(fs.readdirSync(sandbox.config), []);
 }));
 
@@ -225,6 +385,7 @@ test('refreshes at most once a minute, whatever --max-age asks', withSandbox((sa
   assert.equal(report.stale, true);
   assert.equal(report.error, 'http_429');
   assert.deepEqual(JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')), cache);
+  assert.equal(fs.existsSync(lockFile(sandbox)), false);
 }));
 
 test('refreshes a recent cache that holds no usage, as an older version writes it', withSandbox((sandbox) => {
@@ -246,13 +407,16 @@ test('joins a refresh that is already running', withSandbox(async (sandbox) => {
   const now = Date.now();
   writeCache(sandbox, { attempted_at: now, fetched_at: now - 10 * MINUTE, usage: usageOf(weekly(now)) });
   fs.writeFileSync(lockFile(sandbox), 'another process');
-  const child = spawn(process.execPath, [SCRIPT], { env: scriptEnv({ sandbox }) });
+  const mark = path.join(sandbox.tmp, 'started');
+  const child = spawn(process.execPath, [SCRIPT], { env: scriptEnv({ sandbox, env: stubbed(sandbox, replyAt(1), { STUB_MARK: mark }) }) });
   let stdout = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
     stdout += chunk;
   });
   const closed = new Promise((resolve) => child.on('close', resolve));
+  const deadline = Date.now() + 20_000;
+  while (!fs.existsSync(mark) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
   await new Promise((resolve) => setTimeout(resolve, 1000));
   assert.equal(stdout, '');
   writeCache(sandbox, { attempted_at: now, fetched_at: Date.now(), usage: usageOf(weekly(now, { percent: 55 })), error: null });
@@ -261,10 +425,15 @@ test('joins a refresh that is already running', withSandbox(async (sandbox) => {
   const report = JSON.parse(stdout);
   assert.equal(report.stale, false);
   assert.equal(report.limits[0].percent_used, 55);
+  assert.deepEqual(requests(sandbox), []);
 }));
 
 test('survives a malformed cache', withSandbox((sandbox) => {
-  for (const raw of ['not json', 'null', '[]', '{"fetched_at":"today","usage":{"limits":[]}}', '{"fetched_at":1,"usage":7}']) {
+  const limits = '"usage":{"limits":[{"kind":"weekly_all","percent":4}]}';
+  const broken = ['not json', 'null', '[]', '7', '{"fetched_at":"today","usage":{"limits":[]}}', '{"fetched_at":1,"usage":7}'];
+  for (const time of ['1e300', '1e999', '-9e15']) broken.push(`{"fetched_at":${time},"attempted_at":${time},${limits}}`);
+  broken.push(`{"fetched_at":${Date.now()},"usage":{}}`);
+  for (const raw of broken) {
     fs.writeFileSync(cacheFile(sandbox), raw);
     const { status, report } = command(sandbox);
     assert.equal(status, 1, raw);
@@ -272,6 +441,11 @@ test('survives a malformed cache', withSandbox((sandbox) => {
     assert.deepEqual(report, { ok: false, error: 'no_token' }, raw);
   }
   const now = Date.now();
-  writeCache(sandbox, { attempted_at: now, fetched_at: now, usage: { limits: [null, 'x', weekly(now)] } });
-  assert.equal(command(sandbox).report.limits.length, 1);
+  const odd = weekly(now, { resets_at: { toString: 1, valueOf: 1 }, group: 7, weekly_share: 'all' });
+  writeCache(sandbox, { attempted_at: now, fetched_at: now, usage: { limits: [null, 'x', odd], products: 'all', extra_usage: 5 } });
+  const { report } = command(sandbox);
+  assert.equal(report.limits.length, 1);
+  assert.equal(report.limits[0].resets_at, null);
+  assert.deepEqual(report.limits[0].weekly_share, { used_percent: null, allowance_percent: null });
+  assert.deepEqual(report.extra_usage, { enabled: false, percent: null });
 }));

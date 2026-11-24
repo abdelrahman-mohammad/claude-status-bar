@@ -41,6 +41,12 @@ const DEADLINE_MS = LOCK_MS - 2_000;
 const MAX_AGE_MS = 60 * 60_000;
 const TIMEOUT_MS = 4_000;
 const RETRY_DELAY_MS = 1_500;
+// A time stamp this far ahead is a small clock adjustment; further ahead, the
+// clock was set back and the stamp says nothing about age.
+const SKEW_MS = 5_000;
+const RENAME_TRIES = 20;
+const RENAME_WAIT_MS = 50;
+const LEFTOVER_MS = 60_000;
 
 // A TLS-inspecting antivirus or proxy re-signs connections with a root that only
 // the operating system's store trusts. Older Node versions reject the flag and
@@ -63,101 +69,189 @@ function mtime(file) {
   }
 }
 
-/** The cache as { attempted_at, fetched_at, usage, error }, every field optional. */
+// Beyond this a Date is invalid.
+const isTime = (value) => typeof value === 'number' && Math.abs(value) <= 8.64e15;
+
+/** Milliseconds since `time`, or Infinity when it is not a usable time or lies in the future. */
+function since(time, now = Date.now()) {
+  if (!isTime(time)) return Infinity;
+  const ms = now - time;
+  return ms < -SKEW_MS ? Infinity : Math.max(0, ms);
+}
+
+const text = (value) => (typeof value === 'string' ? value : null);
+const number = (value) => (Number.isFinite(value) ? value : null);
+const list = (value) => (Array.isArray(value) ? value : []);
+
+/** Usage with every field of a known type, or undefined without a list of limits. */
+function cleanUsage(usage) {
+  if (!Array.isArray(usage?.limits)) return undefined;
+  return {
+    limits: usage.limits
+      .filter((r) => typeof r?.kind === 'string' && Number.isFinite(r.percent))
+      .map((r) => ({
+        kind: r.kind,
+        group: text(r.group),
+        model: text(r.model),
+        surface: text(r.surface),
+        percent: r.percent,
+        severity: text(r.severity),
+        resets_at: Number.isNaN(Date.parse(text(r.resets_at))) ? null : r.resets_at,
+        headline: r.headline === true,
+        weekly_share: r.weekly_share
+          ? { used_percent: number(r.weekly_share.used_percent), allowance_percent: number(r.weekly_share.allowance_percent) }
+          : null,
+      })),
+    products: list(usage.products)
+      .filter((p) => typeof p?.name === 'string' && Number.isFinite(p.percent_of_weekly_limit))
+      .map((p) => ({ name: p.name, percent_of_weekly_limit: p.percent_of_weekly_limit })),
+    extra_usage: { enabled: usage.extra_usage?.enabled === true, percent: number(usage.extra_usage?.percent) },
+  };
+}
+
+/** The cache as { attempted_at, fetched_at, usage, error }, every field optional and of its type. */
 function readCache() {
-  const cache = readJson(CACHE_FILE);
-  return cache && typeof cache === 'object' ? cache : {};
+  const cache = readJson(CACHE_FILE) || {};
+  const time = (value) => (isTime(value) ? value : undefined);
+  return {
+    attempted_at: time(cache.attempted_at),
+    fetched_at: time(cache.fetched_at),
+    usage: cleanUsage(cache.usage),
+    error: text(cache.error),
+  };
 }
 
-function writeCache(patch) {
-  // Named fields only, so a field an older version wrote does not live on.
-  const { attempted_at, fetched_at, usage, error } = { ...readCache(), ...patch };
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Merges `patch` into the cache. Windows refuses the rename while a reader or a
+ * virus scanner has either file open, so it is tried again, `waitMs` apart; the
+ * render path must not wait and passes nothing. Throws when it never succeeds.
+ */
+function writeCache(patch, waitMs = 0) {
   const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ attempted_at, fetched_at, usage, error }), { mode: 0o600 });
-  fs.renameSync(tmp, CACHE_FILE);
+  fs.writeFileSync(tmp, JSON.stringify({ ...readCache(), ...patch }), { mode: 0o600 });
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return fs.renameSync(tmp, CACHE_FILE);
+    } catch (err) {
+      if (attempt === RENAME_TRIES) {
+        removeFile(tmp);
+        throw err;
+      }
+      if (waitMs) sleep(waitMs);
+    }
+  }
 }
 
-/** Takes the refresh lock, replacing one older than LOCK_MS. False when another refresh holds it. */
+function removeFile(file) {
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // Already gone, or held open; removeLeftovers() gets it later.
+  }
+}
+
+/** Removes temporary files that a write left behind, once they are too old to be in use. */
+function removeLeftovers() {
+  const prefix = path.basename(CACHE_FILE) + '.';
+  for (const name of fs.readdirSync(CONFIG_DIR)) {
+    if (!name.startsWith(prefix) || !/^\d+\.tmp$/.test(name.slice(prefix.length))) continue;
+    const file = path.join(CONFIG_DIR, name);
+    if (since(mtime(file)) > LEFTOVER_MS) removeFile(file);
+  }
+}
+
+function lockHeld() {
+  return since(mtime(LOCK_FILE)) < LOCK_MS;
+}
+
+/** Takes the refresh lock, replacing one older than LOCK_MS. Returns null, or why not: `held` or `unwritable`. */
 function acquireLock() {
   const take = () => {
     try {
       fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx', mode: 0o600 });
-      return true;
-    } catch {
-      return false;
+      return null;
+    } catch (err) {
+      return err.code === 'EEXIST' || fs.existsSync(LOCK_FILE) ? 'held' : 'unwritable';
     }
   };
-  if (take()) return true;
-  if (lockHeld()) return false;
-  try {
-    fs.unlinkSync(LOCK_FILE);
-  } catch {
-    // Another reader removed it first; the retry below settles who gets it.
-  }
+  const refused = take();
+  if (refused !== 'held' || lockHeld()) return refused;
+  // When another reader removed it first, the next line settles who gets it.
+  removeFile(LOCK_FILE);
   return take();
 }
 
-function lockHeld() {
-  return Date.now() - mtime(LOCK_FILE) < LOCK_MS;
-}
-
-function releaseLock() {
+/** Removes the lock when `owner` still holds it. */
+function releaseLock(owner) {
   try {
-    fs.unlinkSync(LOCK_FILE);
+    if (fs.readFileSync(LOCK_FILE, 'utf8') === owner) removeFile(LOCK_FILE);
   } catch {
     // Already gone.
   }
 }
 
-/** Takes the lock and records the attempt. False when another refresh holds the lock. */
-function beginRefresh() {
-  if (!acquireLock()) return false;
+/**
+ * Takes the lock and records the attempt. Returns null, or why not: `held`,
+ * `unwritable`, or `throttled` when the last attempt is younger than the interval.
+ */
+function beginRefresh(intervalMs) {
+  const refused = acquireLock();
+  if (refused) return refused;
+  // Read again under the lock: another process may have finished a refresh since.
+  if (since(readCache().attempted_at) < intervalMs) {
+    releaseLock(String(process.pid));
+    return 'throttled';
+  }
   // Recorded before the child runs, so a child that crashes or hangs still holds
-  // the next attempt back.
+  // the next attempt back. The last error belongs to the last attempt.
   try {
-    writeCache({ attempted_at: Date.now() });
+    writeCache({ attempted_at: Date.now(), error: null });
   } catch {
     // The lock still limits attempts to one per LOCK_MS.
   }
-  return true;
+  return null;
 }
 
+// The child releases the lock in the name of the process that took it.
+const childArgs = () => [...NODE_ARGS, __filename, '--refresh', String(process.pid)];
+
 function scheduleRefresh() {
-  if (!beginRefresh()) return;
+  if (beginRefresh(REFRESH_MS)) return;
   try {
-    spawn(process.execPath, [...NODE_ARGS, __filename, '--refresh'], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    }).unref();
+    spawn(process.execPath, childArgs(), { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   } catch {
-    releaseLock();
+    releaseLock(String(process.pid));
   }
 }
 
+/** Waits while a refresh runs, at most LOCK_MS. False when it still runs then. */
 function waitForRefresh() {
-  const cell = new Int32Array(new SharedArrayBuffer(4));
-  const deadline = Date.now() + LOCK_MS;
-  while (lockHeld() && Date.now() < deadline) Atomics.wait(cell, 0, 0, 100);
+  // Not the wall clock, which can be set back while this waits.
+  const deadline = performance.now() + LOCK_MS;
+  do sleep(100);
+  while (lockHeld() && performance.now() < deadline);
+  return !lockHeld();
 }
 
 /**
- * Refreshes the cache and waits for the result, at most LOCK_MS. Does nothing
- * when the last attempt is younger than MIN_INTERVAL_MS, and joins a refresh that
- * is already running instead of starting a second one.
+ * Refreshes the cache and waits for the result, at most about LOCK_MS. Joins a
+ * refresh that is already running instead of starting a second one. Returns null
+ * when a refresh ran to its end, whose own error is in the cache, or why none did:
+ * `throttled`, `unwritable`, `timeout` or `refresh_failed`.
  */
 function refreshNow() {
-  if (lockHeld()) return waitForRefresh();
-  const last = readCache().attempted_at;
-  if (typeof last === 'number' && Date.now() - last < MIN_INTERVAL_MS) return;
-  if (!beginRefresh()) return waitForRefresh();
-  const child = spawnSync(process.execPath, [...NODE_ARGS, __filename, '--refresh'], {
-    stdio: 'ignore',
-    windowsHide: true,
-    timeout: LOCK_MS,
-  });
-  // The child releases the lock itself; one that never started cannot.
-  if (child.error) releaseLock();
+  const refused = beginRefresh(MIN_INTERVAL_MS);
+  if (refused === 'held') return waitForRefresh() ? null : 'timeout';
+  if (refused) return refused;
+  const child = spawnSync(process.execPath, childArgs(), { stdio: 'ignore', windowsHide: true, timeout: LOCK_MS });
+  if (child.status === 0) return null;
+  // A child that did not end by itself has not released the lock.
+  releaseLock(String(process.pid));
+  return child.error?.code === 'ETIMEDOUT' ? 'timeout' : 'refresh_failed';
 }
 
 /** True for a limit whose window has not reset yet; its percentage still applies. */
@@ -171,19 +265,12 @@ function isCurrent(row, now) {
  */
 function readScoped(now = Date.now()) {
   const cache = readCache();
-  const sinceAttempt = typeof cache.attempted_at === 'number' ? now - cache.attempted_at : Infinity;
-  const sinceFetch = typeof cache.fetched_at === 'number' ? now - cache.fetched_at : Infinity;
-  if (sinceAttempt > REFRESH_MS) scheduleRefresh();
-  if (sinceFetch > MAX_AGE_MS || !Array.isArray(cache.usage?.limits)) return null;
+  if (since(cache.attempted_at, now) > REFRESH_MS) scheduleRefresh();
+  if (since(cache.fetched_at, now) > MAX_AGE_MS || !cache.usage) return null;
   return cache.usage.limits
-    .filter(
-      (r) => r?.kind === 'weekly_scoped' && typeof r.model === 'string' && typeof r.percent === 'number' && isCurrent(r, now)
-    )
+    .filter((r) => r.kind === 'weekly_scoped' && r.model && isCurrent(r, now))
     .map((r) => ({ label: r.model, percent: r.percent }));
 }
-
-const text = (value) => (typeof value === 'string' ? value : null);
-const number = (value) => (typeof value === 'number' ? value : null);
 
 /**
  * The parts of the endpoint's reply that are kept: every limit the server sent, in
@@ -193,34 +280,22 @@ const number = (value) => (typeof value === 'number' ? value : null);
  */
 function parseUsage(reply) {
   if (!Array.isArray(reply?.limits)) return null;
-  const list = (value) => (Array.isArray(value) ? value : []);
   const shares = list(reply.weekly_scoped_shares);
-  const limits = [];
-  reply.limits.forEach((row, index) => {
-    if (typeof row?.kind !== 'string' || typeof row.percent !== 'number') return;
-    // Shares point at a row by its position in the server's list.
-    const share = shares.find((s) => s?.limit_index === index);
-    limits.push({
-      kind: row.kind,
-      group: text(row.group),
-      model: text(row.scope?.model?.display_name),
-      surface: text(row.scope?.surface?.display_name),
-      percent: row.percent,
-      severity: text(row.severity),
-      resets_at: text(row.resets_at),
-      headline: row.is_active === true,
-      weekly_share: share
-        ? { used_percent: number(share.used_percent_of_weekly), allowance_percent: number(share.allowance_percent_of_weekly) }
-        : null,
-    });
+  return cleanUsage({
+    // Shares point at a limit by its position in the server's list.
+    limits: reply.limits.map((row, index) => {
+      const share = shares.find((s) => s?.limit_index === index);
+      return {
+        ...row,
+        model: row?.scope?.model?.display_name,
+        surface: row?.scope?.surface?.display_name,
+        headline: row?.is_active,
+        weekly_share: share && { used_percent: share.used_percent_of_weekly, allowance_percent: share.allowance_percent_of_weekly },
+      };
+    }),
+    products: list(reply.seven_day_breakdown?.rows).map((r) => ({ name: r?.display_name, percent_of_weekly_limit: r?.percent_of_limit })),
+    extra_usage: { enabled: reply.extra_usage?.is_enabled, percent: reply.extra_usage?.utilization },
   });
-  return {
-    limits,
-    products: list(reply.seven_day_breakdown?.rows)
-      .filter((r) => typeof r?.display_name === 'string' && typeof r.percent_of_limit === 'number')
-      .map((r) => ({ name: r.display_name, percent_of_weekly_limit: r.percent_of_limit })),
-    extra_usage: { enabled: reply.extra_usage?.is_enabled === true, percent: number(reply.extra_usage?.utilization) },
-  };
 }
 
 /** The OAuth access token from parsed credentials, or null when it is missing, malformed or expired. */
@@ -301,13 +376,16 @@ function outcome({ usage, error }, now = Date.now()) {
 }
 
 function finishRefresh(result) {
+  let code = 0;
   try {
-    writeCache(outcome(result));
+    writeCache(outcome(result), RENAME_WAIT_MS);
+    removeLeftovers();
   } catch {
-    // Keep the previous cache.
+    // The previous cache stays; the exit code says that this result was lost.
+    code = 1;
   }
-  releaseLock();
-  process.exit(0);
+  releaseLock(process.argv[3]);
+  process.exit(code);
 }
 
 async function refresh() {
@@ -315,11 +393,11 @@ async function refresh() {
   finishRefresh(token ? await fetchUsage(token) : { error: 'no_token' });
 }
 
-if (require.main === module && process.argv.includes('--refresh')) {
+if (require.main === module && process.argv[2] === '--refresh') {
   // The request timeout only measures idle time, so a server that trickles
   // bytes would keep the child alive without this.
-  setTimeout(() => finishRefresh({ error: 'network' }), DEADLINE_MS);
+  setTimeout(() => finishRefresh({ error: 'timeout' }), DEADLINE_MS);
   refresh();
 }
 
-module.exports = { readScoped, readCache, refreshNow, parseUsage, usableToken, fetchUsage, outcome, isCurrent, REFRESH_MS, CACHE_FILE };
+module.exports = { readScoped, readCache, refreshNow, since, parseUsage, usableToken, fetchUsage, outcome, isCurrent, REFRESH_MS, CACHE_FILE };

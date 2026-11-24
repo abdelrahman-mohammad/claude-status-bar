@@ -5,12 +5,12 @@
 //
 // Data younger than --max-age (180 by default, the status line's own refresh
 // interval) is answered from the cache. Older data is refreshed first, at most
-// once a minute. When a refresh fails, the cached data is printed with
+// once a minute. When that is not possible, the cached data is printed with
 // `stale: true` and the reason in `error`.
 //
 // Exits 0 with data and 1 without. The token is never part of the output.
 
-const { readCache, refreshNow, isCurrent, REFRESH_MS } = require('./usage-cache.cjs');
+const { readCache, refreshNow, since, isCurrent, REFRESH_MS } = require('./usage-cache.cjs');
 
 const MINUTE = 60_000;
 // Length of the window behind each group of limits the server names. A group that
@@ -28,7 +28,7 @@ const iso = (ms) => new Date(ms).toISOString();
  */
 function pace(limit, measuredAt) {
   const none = { elapsed_percent: null, projected_percent: null, runs_out_at: null };
-  const length = WINDOW_MS[limit.group];
+  const length = Object.hasOwn(WINDOW_MS, limit.group) ? WINDOW_MS[limit.group] : 0;
   const reset = Date.parse(limit.resets_at);
   if (!length || Number.isNaN(reset)) return none;
   const start = reset - length;
@@ -45,57 +45,65 @@ function pace(limit, measuredAt) {
   };
 }
 
-/** The printed report. `maxAgeMs` decides what counts as stale. */
-function buildReport(cache, { now = Date.now(), maxAgeMs = REFRESH_MS } = {}) {
+/**
+ * The printed report. Data is stale when it was older than `maxAgeMs` at
+ * `startedAt`; `reason` is why no refresh ran, if one was due.
+ */
+function buildReport(cache, { now = Date.now(), startedAt = now, maxAgeMs = REFRESH_MS, reason = null } = {}) {
   const { usage, fetched_at: fetchedAt } = cache;
-  if (!Array.isArray(usage?.limits) || typeof fetchedAt !== 'number') {
-    return { ok: false, error: cache.error || 'no_data' };
+  const error = cache.error || reason;
+  const limits = usage?.limits.filter((limit) => isCurrent(limit, now));
+  // Limits that have all reset say nothing any more; an account with none is an answer.
+  if (!usage || fetchedAt === undefined || (usage.limits.length && !limits.length)) {
+    return { ok: false, error: error || 'no_data' };
   }
-  const stale = now - fetchedAt > maxAgeMs;
+  const age = since(fetchedAt, now);
+  const stale = age > maxAgeMs + (now - startedAt);
   return {
     ok: true,
     stale,
-    error: stale ? cache.error || null : null,
+    error: stale ? error || 'refresh_failed' : null,
     fetched_at: iso(fetchedAt),
-    age_seconds: Math.max(0, round((now - fetchedAt) / 1000)),
-    limits: usage.limits
-      .filter((limit) => typeof limit?.percent === 'number' && isCurrent(limit, now))
-      .map((limit) => {
-        const reset = Date.parse(limit.resets_at);
-        return {
-          kind: limit.kind,
-          scope: limit.model || limit.surface || null,
-          percent_used: limit.percent,
-          percent_left: Math.max(0, round(100 - limit.percent, 1)),
-          severity: limit.severity,
-          headline: limit.headline,
-          resets_at: Number.isNaN(reset) ? null : iso(reset),
-          resets_in_minutes: Number.isNaN(reset) ? null : round((reset - now) / MINUTE),
-          ...pace(limit, fetchedAt),
-          weekly_share: limit.weekly_share,
-        };
-      }),
-    products: usage.products,
+    // Unknown when the clock was set back after the data was read.
+    age_seconds: Number.isFinite(age) ? round(age / 1000) : null,
+    limits: limits.map((limit) => {
+      const reset = Date.parse(limit.resets_at);
+      return {
+        kind: limit.kind,
+        scope: limit.model || limit.surface || null,
+        percent_used: limit.percent,
+        percent_left: Math.max(0, round(100 - limit.percent, 1)),
+        severity: limit.severity,
+        headline: limit.headline,
+        resets_at: Number.isNaN(reset) ? null : iso(reset),
+        resets_in_minutes: Number.isNaN(reset) ? null : round((reset - now) / MINUTE),
+        ...pace(limit, fetchedAt),
+        weekly_share: limit.weekly_share,
+      };
+    }),
+    // Shares of the week, which end with it.
+    products: limits.some((limit) => limit.group === 'weekly') ? usage.products : [],
     extra_usage: usage.extra_usage,
   };
 }
 
-/** Milliseconds from `--max-age <seconds>`, the default without the flag, or null for a bad value. */
+/** Milliseconds from `--max-age <seconds>`, the default without arguments, or null for anything else. */
 function parseMaxAge(argv) {
-  const at = argv.indexOf('--max-age');
-  if (at < 0) return REFRESH_MS;
-  const seconds = Number(argv[at + 1]);
-  return argv[at + 1]?.trim() && seconds >= 0 ? seconds * 1000 : null;
+  if (!argv.length) return REFRESH_MS;
+  const [flag, seconds, ...rest] = argv;
+  return flag === '--max-age' && /^\d{1,9}(\.\d+)?$/.test(seconds) && !rest.length ? Number(seconds) * 1000 : null;
 }
 
 function main(argv) {
+  const startedAt = Date.now();
   const maxAgeMs = parseMaxAge(argv);
-  if (maxAgeMs === null) return { ok: false, error: 'bad_max_age' };
+  if (maxAgeMs === null) return { ok: false, error: 'bad_arguments' };
   if (process.env.CLAUDE_STATUS_BAR_USAGE === 'off') return { ok: false, error: 'disabled' };
   const { usage, fetched_at: fetchedAt } = readCache();
   // An older version caches a recent fetched_at with no usage, so age alone is not enough.
-  if (!usage || typeof fetchedAt !== 'number' || Date.now() - fetchedAt > maxAgeMs) refreshNow();
-  return buildReport(readCache(), { maxAgeMs });
+  const due = !usage || since(fetchedAt, startedAt) > maxAgeMs;
+  const reason = due ? refreshNow() : null;
+  return buildReport(readCache(), { startedAt, maxAgeMs, reason });
 }
 
 if (require.main === module) {

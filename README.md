@@ -141,13 +141,21 @@ node ~/.claude/claude-status-bar/usage.cjs
 }
 ```
 
-- `limits` lists every limit the server sends for your account and no others, so a plan without a 5-hour limit has no such entry. `scope` names the model or surface that a limit covers.
-- `elapsed_percent` is how much of the window has passed. `projected_percent` is where the limit ends at the rate so far, and `runs_out_at` is when it reaches 100%, or `null` when it lasts until the reset. Nothing is projected in the first 5% of a window.
+- `limits` lists every limit the server sends for your account and no others, so a plan without a 5-hour limit has no such entry. A limit whose window has reset since the last refresh is left out. `scope` names the model or surface that a limit covers.
+- `elapsed_percent` is how much of the window has passed, `projected_percent` is where the limit ends at the rate so far, and `runs_out_at` is when it reaches 100% before the reset. `runs_out_at` is `null` when the projection stays at or below 100%, when the limit is already used up (`percent_left` is 0), and when there is no projection (`projected_percent` is `null`): in the first 5% of a window, and for a limit whose window length is unknown.
 - `weekly_share` is how much of the whole weekly limit a scoped limit has used and may use.
-- It shares the status line's cache and throttle. Data younger than three minutes is answered at once; `--max-age <seconds>` changes that. A refresh happens at most once a minute and takes up to 15 seconds.
-- When a refresh fails, the cached data is printed with `stale: true` and the reason in `error`. Without any data the exit code is 1 and `ok` is `false`.
+- It shares the status line's cache and throttle. Data younger than three minutes is answered at once; `--max-age <seconds>` changes that. A refresh happens at most once a minute and takes about 15 seconds at most.
+- When the data cannot be refreshed, the cached data is printed with `stale: true` and the reason in `error`. Without usable data the exit code is 1 and `ok` is `false`.
 
-`error` is `no_token` (no credentials file, or an expired token that Claude Code has not renewed yet), `network`, `http_<status>`, `bad_reply`, `no_data`, `disabled` or `bad_max_age`.
+| `error` | Meaning |
+| --- | --- |
+| `no_token` | No credentials file, or an expired token that Claude Code has not renewed yet |
+| `network`, `timeout` | The endpoint could not be reached, or not in time |
+| `http_<status>`, `bad_reply` | The endpoint refused, or sent something that is not a usage reply |
+| `throttled` | The last refresh was less than a minute ago |
+| `refresh_failed`, `unwritable` | The refresh did not run to its end, or the config directory cannot be written |
+| `no_data` | Nothing is cached yet, or every cached limit has reset |
+| `disabled`, `bad_arguments` | `CLAUDE_STATUS_BAR_USAGE` is `off`, or the arguments are not understood |
 
 To let Claude call it on its own, install the skill:
 
