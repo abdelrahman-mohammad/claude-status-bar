@@ -23,11 +23,11 @@ function createSandbox() {
 }
 
 /**
- * Raw stdout of `script` with `input` on stdin; an object is sent as JSON.
- * The caller's auto-compact settings, opt-out, config directory and temp directory
- * never reach the script, so a developer's own settings cannot change a result.
+ * Environment for a script under test. The caller's auto-compact settings,
+ * opt-out, config directory and temp directory never reach the script, so a
+ * developer's own settings cannot change a result.
  */
-function run(script, input, { sandbox, env = {} } = {}) {
+function scriptEnv({ sandbox, env = {} } = {}) {
   const base = { ...process.env };
   for (const name of ['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'CLAUDE_STATUS_BAR_USAGE', 'CLAUDE_CONFIG_DIR']) {
     delete base[name];
@@ -40,9 +40,14 @@ function run(script, input, { sandbox, env = {} } = {}) {
       CLAUDE_CONFIG_DIR: sandbox.config,
     });
   }
+  return { ...base, ...env };
+}
+
+/** Raw stdout of `script` with `input` on stdin; an object is sent as JSON. */
+function run(script, input, options) {
   const result = spawnSync(process.execPath, [path.join(ROOT, script)], {
     input: typeof input === 'string' ? input : JSON.stringify(input),
-    env: { ...base, ...env },
+    env: scriptEnv(options),
     encoding: 'utf8',
   });
   if (result.status !== 0) {
@@ -55,4 +60,4 @@ function plain(text) {
   return text.replace(ANSI, '');
 }
 
-module.exports = { createSandbox, run, plain };
+module.exports = { ROOT, createSandbox, scriptEnv, run, plain };

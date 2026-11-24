@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
-const { scopedRows, usableToken, fetchRows } = require('../usage-cache.cjs');
+const { parseUsage, usableToken, fetchUsage, outcome } = require('../usage-cache.cjs');
 const { createSandbox, run, plain } = require('./helpers.cjs');
 
 const YELLOW = '\x1b[33m';
@@ -19,7 +19,7 @@ const BASE = {
   rate_limits: { five_hour: { used_percentage: 22 }, seven_day: { used_percentage: 18 } },
 };
 
-// Shape of the endpoint's limits array, with values made up.
+// Shape of the endpoint's reply, with values made up.
 const LIMITS = [
   { kind: 'session', group: 'session', percent: 98, resets_at: '2099-01-01T15:00:00.000000+00:00', scope: null },
   { kind: 'weekly_all', group: 'weekly', percent: 22, resets_at: '2099-01-07T10:00:00.000000+00:00', scope: null },
@@ -27,7 +27,29 @@ const LIMITS = [
   { kind: 'weekly_scoped', group: 'weekly', percent: 5, resets_at: null, scope: { model: null, surface: { display_name: 'Cowork' } } },
   { kind: 'weekly_scoped', group: 'weekly', percent: null, resets_at: null, scope: { model: { display_name: 'Opus' } } },
 ];
-const FABLE = { label: 'Fable', percent: 37, resets_at: '2099-01-07T10:00:00.000000+00:00' };
+const REPLY = {
+  limits: LIMITS,
+  weekly_scoped_shares: [{ limit_index: 2, used_percent_of_weekly: 18, allowance_percent_of_weekly: 50 }],
+  seven_day_breakdown: {
+    rows: [
+      { key: 'claude_code', display_name: 'Claude Code', percent: 90, percent_of_limit: 20 },
+      { key: 'broken', display_name: 'Broken' },
+    ],
+  },
+  extra_usage: { is_enabled: true, utilization: 12 },
+};
+// One limit as it is cached.
+const FABLE = {
+  kind: 'weekly_scoped',
+  group: 'weekly',
+  model: 'Fable',
+  surface: null,
+  percent: 37,
+  severity: null,
+  resets_at: '2099-01-07T10:00:00.000000+00:00',
+  headline: false,
+  weekly_share: { used_percent: 18, allowance_percent: 50 },
+};
 
 function withSandbox(fn) {
   return async () => {
@@ -48,8 +70,8 @@ function writeCache(sandbox, cache) {
   fs.writeFileSync(cacheFile(sandbox), JSON.stringify({ attempted_at: Date.now(), ...cache }));
 }
 
-function fresh(rows) {
-  return { fetched_at: Date.now(), rows };
+function fresh(limits) {
+  return { fetched_at: Date.now(), usage: { limits } };
 }
 
 async function waitFor(check, timeoutMs = 15_000) {
@@ -69,6 +91,8 @@ async function stubEndpoint(handler) {
     handler(req, res);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  // A request that never settles then fails its test instead of hanging the run.
+  server.unref();
   const { port } = server.address();
   const requested = [];
   const request = (options, callback) => {
@@ -82,13 +106,53 @@ async function stubEndpoint(handler) {
   return { request, requested, seen, close };
 }
 
-test('scopedRows keeps only weekly rows scoped to a model', () => {
-  assert.deepEqual(scopedRows(LIMITS), [FABLE]);
+test('parseUsage keeps every limit with a percentage, in the server order', () => {
+  const { limits } = parseUsage(REPLY);
+  assert.deepEqual(
+    limits.map((l) => [l.kind, l.model, l.surface, l.percent]),
+    [
+      ['session', null, null, 98],
+      ['weekly_all', null, null, 22],
+      ['weekly_scoped', 'Fable', null, 37],
+      ['weekly_scoped', null, 'Cowork', 5],
+    ]
+  );
+  assert.deepEqual(limits[2], FABLE);
 });
 
-test('scopedRows returns null when the reply has no limits array', () => {
-  assert.equal(scopedRows(undefined), null);
-  assert.equal(scopedRows({}), null);
+test('parseUsage keeps a limit it does not know', () => {
+  const reply = { limits: [{ kind: 'monthly_new', group: 'monthly', percent: 4, severity: 'normal', is_active: true }] };
+  const [limit] = parseUsage(reply).limits;
+  assert.equal(limit.kind, 'monthly_new');
+  assert.equal(limit.severity, 'normal');
+  assert.equal(limit.headline, true);
+});
+
+test('parseUsage matches a share by the position in the server list, skipped rows included', () => {
+  const reply = {
+    limits: [{ kind: 'session', percent: null }, LIMITS[2]],
+    weekly_scoped_shares: [{ limit_index: 1, used_percent_of_weekly: 7, allowance_percent_of_weekly: 50 }],
+  };
+  const { limits } = parseUsage(reply);
+  assert.equal(limits.length, 1);
+  assert.deepEqual(limits[0].weekly_share, { used_percent: 7, allowance_percent: 50 });
+});
+
+test('parseUsage keeps the products and extra usage', () => {
+  const usage = parseUsage(REPLY);
+  assert.deepEqual(usage.products, [{ name: 'Claude Code', percent_of_weekly_limit: 20 }]);
+  assert.deepEqual(usage.extra_usage, { enabled: true, percent: 12 });
+  assert.deepEqual(parseUsage({ limits: [] }), { limits: [], products: [], extra_usage: { enabled: false, percent: null } });
+});
+
+test('parseUsage returns null when the reply has no limits array', () => {
+  for (const reply of [undefined, null, {}, { limits: {} }, 'text']) assert.equal(parseUsage(reply), null);
+});
+
+test('a successful refresh clears the last error, and a failure keeps the previous usage', () => {
+  const usage = parseUsage(REPLY);
+  assert.deepEqual(outcome({ usage }, 5), { fetched_at: 5, usage, error: null });
+  assert.deepEqual(outcome({ error: 'http_429' }, 5), { error: 'http_429' });
 });
 
 test('usableToken accepts a live token and rejects missing, malformed and expired ones', () => {
@@ -103,10 +167,10 @@ test('usableToken accepts a live token and rejects missing, malformed and expire
   assert.equal(usableToken(null, now), null);
 });
 
-test('fetchRows sends the token to the usage endpoint and returns its rows', async () => {
-  const stub = await stubEndpoint((req, res) => res.end(JSON.stringify({ limits: LIMITS })));
+test('fetchUsage sends the token to the usage endpoint and returns the parsed reply', async () => {
+  const stub = await stubEndpoint((req, res) => res.end(JSON.stringify(REPLY)));
   try {
-    assert.deepEqual(await fetchRows('sk-test-token', { request: stub.request }), [FABLE]);
+    assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request }), { usage: parseUsage(REPLY) });
     assert.equal(stub.requested[0].host, 'api.anthropic.com');
     assert.deepEqual(stub.seen, [{ path: '/api/oauth/usage', authorization: 'Bearer sk-test-token' }]);
   } finally {
@@ -114,47 +178,62 @@ test('fetchRows sends the token to the usage endpoint and returns its rows', asy
   }
 });
 
-test('fetchRows gives up on an error status without retrying', async () => {
+test('fetchUsage reports an error status without retrying', async () => {
   const stub = await stubEndpoint((req, res) => {
     res.statusCode = 429;
     res.end('{}');
   });
   try {
-    assert.equal(await fetchRows('sk-test-token', { request: stub.request, retryDelayMs: 10 }), null);
+    assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request, retryDelayMs: 10 }), { error: 'http_429' });
     assert.equal(stub.seen.length, 1);
   } finally {
     await stub.close();
   }
 });
 
-test('fetchRows returns null for a body that is not JSON', async () => {
-  const stub = await stubEndpoint((req, res) => res.end('<html>'));
+test('fetchUsage reports a body that is not a usage reply', async () => {
+  for (const body of ['<html>', '{}', 'null']) {
+    const stub = await stubEndpoint((req, res) => res.end(body));
+    try {
+      assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request }), { error: 'bad_reply' });
+    } finally {
+      await stub.close();
+    }
+  }
+});
+
+test('fetchUsage reports a reply that is cut short', async () => {
+  const stub = await stubEndpoint((req, res) => {
+    res.writeHead(200, { 'Content-Length': 1000 });
+    res.write('{"limits":');
+    setTimeout(() => req.socket.destroy(), 50);
+  });
   try {
-    assert.equal(await fetchRows('sk-test-token', { request: stub.request }), null);
+    assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request, retryDelayMs: 10 }), { error: 'network' });
   } finally {
     await stub.close();
   }
 });
 
-test('fetchRows retries a dropped connection once', async () => {
+test('fetchUsage retries a dropped connection once', async () => {
   let calls = 0;
   const stub = await stubEndpoint((req, res) => {
     calls += 1;
     if (calls === 1) return req.socket.destroy();
-    res.end(JSON.stringify({ limits: LIMITS }));
+    res.end(JSON.stringify(REPLY));
   });
   try {
-    assert.deepEqual(await fetchRows('sk-test-token', { request: stub.request, retryDelayMs: 10 }), [FABLE]);
+    assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request, retryDelayMs: 10 }), { usage: parseUsage(REPLY) });
     assert.equal(calls, 2);
   } finally {
     await stub.close();
   }
 });
 
-test('fetchRows gives up after a second timeout', async () => {
+test('fetchUsage gives up after a second timeout', async () => {
   const stub = await stubEndpoint(() => {});
   try {
-    assert.equal(await fetchRows('sk-test-token', { request: stub.request, retryDelayMs: 10, timeoutMs: 200 }), null);
+    assert.deepEqual(await fetchUsage('sk-test-token', { request: stub.request, retryDelayMs: 10, timeoutMs: 200 }), { error: 'network' });
     assert.equal(stub.seen.length, 2);
   } finally {
     await stub.close();
@@ -174,7 +253,7 @@ test('colors the Fable limit like the other limits', withSandbox((sandbox) => {
 }));
 
 test('hides rows older than an hour', withSandbox((sandbox) => {
-  writeCache(sandbox, { fetched_at: Date.now() - 2 * HOUR, rows: [FABLE] });
+  writeCache(sandbox, { fetched_at: Date.now() - 2 * HOUR, usage: { limits: [FABLE] } });
   assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
 }));
 
@@ -184,12 +263,27 @@ test('hides a row whose window has already reset', withSandbox((sandbox) => {
 }));
 
 test('ignores malformed cached rows instead of blanking the line', withSandbox((sandbox) => {
-  writeCache(sandbox, fresh([null, { label: 7 }, FABLE]));
+  writeCache(sandbox, fresh([null, { kind: 'weekly_scoped', model: 7 }, FABLE]));
   assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22% · Fable 37%\n');
 }));
 
+test('an odd cached value costs the segment, never the line', withSandbox((sandbox) => {
+  const odd = { ...FABLE, resets_at: { toString: 1, valueOf: 1 } };
+  writeCache(sandbox, { fetched_at: 1e300, usage: { limits: [FABLE] } });
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
+  writeCache(sandbox, fresh([odd]));
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22% · Fable 37%\n');
+}));
+
+test('a time from before the clock was set back is expired', withSandbox(async (sandbox) => {
+  const ahead = Date.now() + 6 * HOUR;
+  fs.writeFileSync(cacheFile(sandbox), JSON.stringify({ attempted_at: ahead, fetched_at: ahead, usage: { limits: [FABLE] } }));
+  assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
+  await waitFor(() => JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')).error === 'no_token' && !fs.existsSync(cacheFile(sandbox) + '.lock'));
+}));
+
 test('hides the segment when the account has no Fable row', withSandbox((sandbox) => {
-  writeCache(sandbox, fresh([{ label: 'Opus', percent: 50, resets_at: null }]));
+  writeCache(sandbox, fresh([{ ...FABLE, model: 'Opus' }, { ...FABLE, kind: 'weekly_all' }]));
   assert.equal(plain(run('statusline.cjs', BASE, { sandbox })), 'my-app  Opus xhigh  34%  5h 22%\n');
 }));
 
@@ -212,7 +306,24 @@ test('a due refresh without credentials records the attempt and releases the loc
   await waitFor(() => fs.existsSync(cacheFile(sandbox)) && !fs.existsSync(cacheFile(sandbox) + '.lock'));
   const cache = JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8'));
   assert.equal(typeof cache.attempted_at, 'number');
-  assert.equal(cache.rows, undefined);
+  assert.equal(cache.usage, undefined);
+  assert.equal(cache.error, 'no_token');
+}));
+
+test('a refresh drops fields an older version cached', withSandbox(async (sandbox) => {
+  fs.writeFileSync(cacheFile(sandbox), JSON.stringify({ rows: [{ label: 'Fable', percent: 37 }], attempted_at: 0 }));
+  run('statusline.cjs', BASE, { sandbox });
+  await waitFor(() => !fs.existsSync(cacheFile(sandbox) + '.lock'));
+  assert.equal(JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')).rows, undefined);
+}));
+
+test('a due refresh leaves a running one alone', withSandbox((sandbox) => {
+  const cache = { attempted_at: Date.now() - HOUR };
+  writeCache(sandbox, cache);
+  fs.writeFileSync(cacheFile(sandbox) + '.lock', 'another process');
+  run('statusline.cjs', BASE, { sandbox });
+  assert.equal(fs.readFileSync(cacheFile(sandbox) + '.lock', 'utf8'), 'another process');
+  assert.deepEqual(JSON.parse(fs.readFileSync(cacheFile(sandbox), 'utf8')), cache);
 }));
 
 test('a refresh is not repeated within three minutes of an attempt', withSandbox((sandbox) => {
