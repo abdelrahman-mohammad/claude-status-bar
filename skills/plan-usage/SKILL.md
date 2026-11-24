@@ -1,7 +1,6 @@
 ---
 name: plan-usage
 description: Reports how much of the Claude plan is used, as JSON - each limit with its percentage, reset time, pace and projected run-out time. Use when asked about usage, limits, quota or resets, and before work that uses a lot of them, such as a large fan-out or a long background run.
-allowed-tools: Bash(node "$HOME/.claude/claude-status-bar/usage.cjs":*) PowerShell(node "$HOME/.claude/claude-status-bar/usage.cjs":*)
 ---
 
 Run:

@@ -164,6 +164,18 @@ mkdir -p ~/.claude/skills/plan-usage
 cp ~/.claude/claude-status-bar/skills/plan-usage/SKILL.md ~/.claude/skills/plan-usage/
 ```
 
+In auto mode Claude runs the command without asking. In the default mode it asks, unless `settings.json` allows it:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(node \"$HOME/.claude/claude-status-bar/usage.cjs\":*)"
+    ]
+  }
+}
+```
+
 ## Colors and thresholds
 
 The context percentage turns red near auto-compaction, and yellow ahead of that: 20 points below red, or at half of red when red is low. The agent rows use the same thresholds, scaled to each agent's own context window.
